@@ -2,6 +2,8 @@ package clf
 
 import (
 	"fmt"
+
+	"github.com/periaate/common"
 )
 
 type Flag struct {
@@ -57,66 +59,136 @@ func ParseNames(flags []*Flag) (opts *Options, err error) {
 			}
 			flag.Name = flag.Keys[0]
 		}
-		if v, ok := opts.Flags[flag.Name]; ok {
+		if v, ok := opts.Names[flag.Name]; ok {
 			err = fmt.Errorf("names must be unique! name %s used by both %v and %v", flag.Name, flag, v)
 			return
 		}
-		opts.Flags[flag.Name] = flag
+		opts.Names[flag.Name] = flag
 
 		if len(flag.Keys) == 0 {
-			opts.Names[flag.Name] = flag
+			opts.Flags[flag.Name] = flag
 			continue
 		}
 
 		for _, key := range flag.Keys {
-			if v, ok := opts.Names[key]; ok {
+			if v, ok := opts.Flags[key]; ok {
 				err = fmt.Errorf("keys must be unique! %s collides with %s with key %s", flag.Name, v.Name, key)
 				return
 			}
-			opts.Names[key] = flag
+			opts.Flags[key] = flag
 		}
 	}
 	return
 }
 
+var glog common.Logger = common.DummyLogger{}
+
+func SetGlobalLogger(s common.Logger) { glog = s }
+
 func Parse(args []string, flags []*Flag) (opts *Options, err error) {
 	opts, err = ParseNames(flags)
+	for k, f := range opts.Flags {
+		glog.Debug("REGISTERED FLAG", "FLAG", f.Name, "KEYS", f.Keys, "KEY", k)
+	}
+
 	var cur *Flag
 	var i int
-	for _, arg := range args {
-		if cur != nil && i > 1 {
-			if cur.AtMost < i {
+	var capturing bool
+	reset := func() {
+		if cur != nil {
+			glog.Debug("resetting args", "target", cur.Name, "captured", cur.Values)
+			if cur.Handler != nil {
+				glog.Debug("calling handler", "target", cur.Name)
 				cur.Handler(cur.Values)
 				cur.Values = nil
-				cur = nil
-				i = 0
 			}
 		}
+		cur = nil
+		i = 0
+		capturing = false
+	}
+	canReset := func() bool {
+		if cur == nil {
+			return true
+		}
+		if cur.Exactly == -1 {
+			glog.Debug("can reset", "cause", "flag isn't capturing", "name", cur.Name)
+			return true
+		}
+		if cur.Exactly != 0 && cur.Exactly == i {
+			glog.Debug("can reset", "cause", "EXC fulfilled", "name", cur.Name, "i", i, "EXC", cur.Exactly)
+			return true
+		}
+		r := cur.AtLeast <= i
+		if r {
+			glog.Debug("can reset", "cause", "ATL fulfilled", "name", cur.Name, "i", i, "ATL", cur.AtLeast)
+		} else {
+			glog.Debug("can't reset", "cause", "ATL not fulfilled", "name", cur.Name, "i", i, "ATL", cur.AtLeast)
+		}
+		return r
+	}
 
-		f, ok := opts.Names[arg]
-		if !ok {
-			if cur == nil || cur.Exactly == -1 {
-				opts.Rest = append(opts.Rest, arg)
-			} else {
-				i++
-				cur.Values = append(cur.Values, arg)
+	shouldReset := func() bool {
+		if cur == nil {
+			return false
+		}
+		if cur.Exactly != 0 && (cur.Exactly == i || cur.Exactly == -1) {
+			glog.Debug("should reset", "cause", "EXC", "name", cur.Name, "i", i, "EXC", cur.Exactly)
+			return true
+		}
+
+		if cur.AtMost != 0 {
+			if cur.AtLeast != 0 {
+				if cur.AtLeast <= i {
+					return false
+				}
 			}
+			if cur.AtMost < i {
+				glog.Debug("should reset", "cause", "ATM", "name", cur.Name, "i", i, "ATM", cur.AtMost)
+				return true
+			}
+		}
+		return false
+	}
+	begin := func(f *Flag, arg string) {
+		if cur != nil {
+			reset()
+		}
+		glog.Debug("begin flag capture", "name", f.Name, "arg", arg, "ATM", f.AtMost, "ATL", f.AtLeast, "EXC", f.Exactly)
+		cur = f
+		capturing = true
+	}
+	value := func(arg string) {
+		i++
+		glog.Debug("FOUND MATCH", "FLAG", cur.Name, "ARG", arg, "INDEX", i)
+		cur.Values = append(cur.Values, arg)
+	}
+
+	for _, arg := range args {
+		if canReset() {
+			if shouldReset() {
+				reset()
+			}
+
+			f, ok := opts.Flags[arg]
+			if ok {
+				begin(f, arg)
+				continue
+			}
+
+		}
+
+		switch {
+		case capturing:
+			value(arg)
 			continue
 		}
-		if cur != nil {
-			cur.Handler(cur.Values)
-			cur.Values = nil
-		}
-		i = 0
-		f.Present++
 
-		cur = f
+		glog.Debug("not capturing and no flag found, adding to rest", "arg", arg)
+		opts.Rest = append(opts.Rest, arg)
 	}
-	if cur != nil {
-		if cur.Handler != nil {
-			cur.Handler(cur.Values)
-		}
-	}
+
+	reset()
 
 	return
 }
